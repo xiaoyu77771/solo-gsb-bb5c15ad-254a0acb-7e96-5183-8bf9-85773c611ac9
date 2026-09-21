@@ -6,6 +6,8 @@
 
 完整条件序列仅保存在服务端，通过推进接口按周期受控揭盲：
 创建与详情接口只返回受试者名册，不暴露任何后续周期安排。
+进入下一周期前还须通过完成 / 洗脱期门禁：上一周期先由完成接口
+登记服务端完成时间，且已达 ``completed_at + washout_seconds``。
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ from . import db
 from .schemas import (
     AdvanceOut,
     AdvanceRequest,
+    CompleteOut,
+    CompleteRequest,
     ExperimentCreate,
     ExperimentOut,
     ExperimentSummary,
@@ -29,17 +33,29 @@ from .schemas import (
 from .williams import group_size, williams_sequences
 
 
+def server_now() -> datetime:
+    """服务端当前时间（UTC，感知时区）。
+
+    周期完成时间与洗脱期是否届满全部以此为准，客户端时间不参与判断，
+    测试中可 monkeypatch 本函数模拟等待。
+    """
+    return datetime.now(timezone.utc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 容器 / 进程启动时建表（旧库自动补齐新增表）
+    # 容器 / 进程启动时建表与迁移（旧库自动补齐新增表与 washout_seconds 列）
     db.init_db()
     yield
 
 
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
-    description="基于 Williams 平衡拉丁方的交叉实验顺序分配与按周期受控揭盲服务",
-    version="1.1.0",
+    description=(
+        "基于 Williams 平衡拉丁方的交叉实验顺序分配、按周期受控揭盲与"
+        "完成 / 洗脱期门禁服务"
+    ),
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -120,9 +136,15 @@ def create_experiment(payload: ExperimentCreate) -> dict:
     ]
 
     experiment_id = uuid.uuid4().hex
-    created_at = datetime.now(timezone.utc).isoformat()
+    created_at = server_now().isoformat()
     db.insert_experiment(
-        experiment_id, conditions, payload.seed, size, created_at, assignments
+        experiment_id,
+        conditions,
+        payload.seed,
+        size,
+        created_at,
+        assignments,
+        payload.washout_seconds,
     )
 
     return {
@@ -132,6 +154,7 @@ def create_experiment(payload: ExperimentCreate) -> dict:
         "group_size": size,
         "num_subjects": count,
         "num_periods": n,
+        "washout_seconds": payload.washout_seconds,
         "created_at": created_at,
         "assignments": [{"subject_id": s} for s in subject_ids],
     }
@@ -161,10 +184,14 @@ def get_experiment(experiment_id: str) -> dict:
 @app.post(
     "/experiments/{experiment_id}/advance",
     response_model=AdvanceOut,
-    summary="按周期受控揭盲：仅当 expected_period 为下一周期时返回当前条件并原子推进",
+    summary=(
+        "按周期受控揭盲：通过完成 / 洗脱门禁且 expected_period 为下一周期时，"
+        "返回当前条件并原子推进"
+    ),
 )
 def advance_period(experiment_id: str, payload: AdvanceRequest) -> dict:
-    revealed_at = datetime.now(timezone.utc).isoformat()
+    now = server_now()
+    revealed_at = now.isoformat()
     try:
         result = db.advance_period(
             experiment_id,
@@ -172,6 +199,7 @@ def advance_period(experiment_id: str, payload: AdvanceRequest) -> dict:
             payload.expected_period,
             payload.request_id,
             revealed_at,
+            now,
         )
     except db.RequestIdConflictError:
         # 同一幂等键却提交了不同的受试者或周期
@@ -197,6 +225,77 @@ def advance_period(experiment_id: str, payload: AdvanceRequest) -> dict:
                 "next_period": exc.next_period,
             },
         )
+    except db.WashoutNotElapsedError as exc:
+        # 上一周期未完成或洗脱期未届满：响应只含门禁状态，不泄露下一条件
+        detail = {
+            "message": (
+                "上一周期尚未登记完成，无法推进下一周期"
+                if exc.reason == "previous_period_not_completed"
+                else "洗脱期尚未届满，下一周期暂不可揭盲"
+            ),
+            "reason": exc.reason,
+            "next_period": exc.next_period,
+        }
+        if exc.retry_after_seconds is not None:
+            detail["retry_after_seconds"] = exc.retry_after_seconds
+            detail["next_available_at"] = exc.next_available_at
+        raise HTTPException(status_code=409, detail=detail)
+
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "实验或受试者不存在",
+                "experiment_id": experiment_id,
+                "subject_id": payload.subject_id,
+            },
+        )
+    return result
+
+
+@app.post(
+    "/experiments/{experiment_id}/complete",
+    response_model=CompleteOut,
+    summary=(
+        "登记当前周期完成时间：只有已揭盲且尚未完成的周期可登记，"
+        "同一 request_id 重放原结果"
+    ),
+)
+def complete_period(experiment_id: str, payload: CompleteRequest) -> dict:
+    # 完成时间由服务端时钟生成，作为洗脱期门禁基准
+    completed_at = server_now().isoformat()
+    try:
+        result = db.complete_period(
+            experiment_id,
+            payload.subject_id,
+            payload.expected_period,
+            payload.request_id,
+            completed_at,
+        )
+    except db.RequestIdConflictError:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "request_id 已被其他请求占用",
+                "reason": "request_id_conflict",
+                "request_id": payload.request_id,
+            },
+        )
+    except db.CompletionStateError as exc:
+        messages = {
+            "no_revealed_period": "该受试者尚无已揭盲周期，无法登记完成",
+            "period_not_revealed": "目标周期尚未揭盲，不能提前登记完成",
+            "period_already_completed": "目标周期已登记完成，请勿重复提交",
+            "period_mismatch": "目标周期不是当前待完成（已揭盲且未完成）周期",
+        }
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": messages[exc.reason],
+                "reason": exc.reason,
+                "current_period": exc.current_period,
+            },
+        )
 
     if result is None:
         raise HTTPException(
@@ -213,10 +312,10 @@ def advance_period(experiment_id: str, payload: AdvanceRequest) -> dict:
 @app.get(
     "/experiments/{experiment_id}/subjects/{subject_id}/progress",
     response_model=ProgressOut,
-    summary="查询受试者揭盲进度（只含已揭盲记录与 next_period）",
+    summary="查询受试者揭盲进度（只含已揭盲 / 已完成记录、next_period 与 next_available_at）",
 )
 def get_progress(experiment_id: str, subject_id: str) -> dict:
-    progress = db.get_progress(experiment_id, subject_id)
+    progress = db.get_progress(experiment_id, subject_id, server_now())
     if progress is None:
         raise HTTPException(
             status_code=404,
