@@ -15,6 +15,14 @@ class ExperimentCreate(BaseModel):
         ..., min_length=1, description="互异受试者 ID"
     )
     seed: int = Field(..., description="随机种子，相同输入与种子产生相同分配")
+    washout_seconds: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "相邻周期间的洗脱期秒数（非负）。上一周期完成后必须再经过该时长"
+            "才能推进下一周期；默认 0 表示只需登记完成即可推进"
+        ),
+    )
 
 
 class AssignmentOut(BaseModel):
@@ -30,6 +38,7 @@ class ExperimentOut(BaseModel):
     group_size: int
     num_subjects: int
     num_periods: int
+    washout_seconds: int
     created_at: str
     assignments: list[AssignmentOut]
 
@@ -41,6 +50,7 @@ class ExperimentSummary(BaseModel):
     group_size: int
     num_subjects: int
     num_periods: int
+    washout_seconds: int
     created_at: str
 
 
@@ -67,20 +77,45 @@ class AdvanceOut(BaseModel):
     revealed_at: str
 
 
+class CompleteRequest(BaseModel):
+    """周期完成登记请求。"""
+
+    subject_id: str = Field(..., min_length=1, description="受试者 ID")
+    period: int = Field(
+        ...,
+        ge=1,
+        description="要登记完成的周期（必须是已揭盲且尚未完成的当前周期）",
+    )
+    request_id: str = Field(
+        ..., min_length=1, description="幂等键，相同 request_id 重试返回原结果"
+    )
+
+
+class CompleteOut(BaseModel):
+    experiment_id: str
+    subject_id: str
+    period: int
+    request_id: str
+    completed_at: str
+
+
 class RevealOut(BaseModel):
-    """一条已揭盲记录。"""
+    """一条已揭盲记录；completed_at 为该周期完成登记时间（未登记为 null）。"""
 
     period: int
     condition: str
     revealed_at: str
+    completed_at: str | None = None
 
 
 class ProgressOut(BaseModel):
-    """受试者进度：只含已揭盲记录与 next_period，不暴露后续安排。"""
+    """受试者进度：只含已揭盲记录、下一周期与下一周期可推进时间。"""
 
     experiment_id: str
     subject_id: str
     next_period: int
     num_periods: int
+    washout_seconds: int
     completed: bool
+    next_available_at: str | None = None
     reveals: list[RevealOut]

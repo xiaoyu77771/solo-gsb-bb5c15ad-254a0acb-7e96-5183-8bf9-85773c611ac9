@@ -5,10 +5,12 @@ from __future__ import annotations
 import sqlite3
 import threading
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app import db
 from app.main import app
 from app.williams import group_size, williams_sequences
 
@@ -47,6 +49,7 @@ def create_experiment(
     conditions: list[str] | None = None,
     subject_ids: list[str] | None = None,
     seed: int = 42,
+    washout_seconds: int = 0,
 ):
     conditions = conditions or ["A", "B", "C"]
     subject_ids = subject_ids or [f"s{i}" for i in range(6)]
@@ -56,10 +59,46 @@ def create_experiment(
             "conditions": conditions,
             "subject_ids": subject_ids,
             "seed": seed,
+            "washout_seconds": washout_seconds,
         },
     )
     assert resp.status_code == 201, resp.text
     return resp.json(), subject_ids
+
+
+def complete_period(
+    client: TestClient,
+    experiment_id: str,
+    subject_id: str,
+    period: int,
+    request_id: str | None = None,
+):
+    resp = client.post(
+        f"/experiments/{experiment_id}/complete",
+        json={
+            "subject_id": subject_id,
+            "period": period,
+            "request_id": request_id or f"{subject_id}-c{period}",
+        },
+    )
+    return resp
+
+
+def reveal_period(
+    client: TestClient,
+    experiment_id: str,
+    subject_id: str,
+    period: int,
+    req_prefix: str = "",
+):
+    return client.post(
+        f"/experiments/{experiment_id}/advance",
+        json={
+            "subject_id": subject_id,
+            "expected_period": period,
+            "request_id": f"{req_prefix}{subject_id}-p{period}",
+        },
+    )
 
 
 def reveal_sequence(
@@ -69,21 +108,28 @@ def reveal_sequence(
     num_periods: int,
     req_prefix: str = "",
 ) -> list[str]:
-    """通过推进接口逐周期揭盲，重建该受试者的条件序列。"""
+    """通过推进接口逐周期揭盲，重建该受试者的条件序列。
+
+    默认实验 washout=0，因此每个周期揭盲后登记完成即可立刻推进下一周期。
+    """
     sequence: list[str] = []
     for period in range(1, num_periods + 1):
-        resp = client.post(
-            f"/experiments/{experiment_id}/advance",
-            json={
-                "subject_id": subject_id,
-                "expected_period": period,
-                "request_id": f"{req_prefix}{subject_id}-p{period}",
-            },
+        resp = reveal_period(
+            client, experiment_id, subject_id, period, req_prefix
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["period"] == period
         sequence.append(body["condition"])
+        if period < num_periods:
+            done = complete_period(
+                client,
+                experiment_id,
+                subject_id,
+                period,
+                f"{req_prefix}{subject_id}-c{period}",
+            )
+            assert done.status_code == 200, done.text
     return sequence
 
 
@@ -269,7 +315,9 @@ def test_advance_reveals_one_period_and_progresses(client: TestClient) -> None:
     progress = client.get(f"/experiments/{eid}/subjects/s0/progress").json()
     assert progress["next_period"] == 1
     assert progress["num_periods"] == 3
+    assert progress["washout_seconds"] == 0
     assert progress["completed"] is False
+    assert progress["next_available_at"] is None
     assert progress["reveals"] == []
 
     first = client.post(
@@ -285,11 +333,13 @@ def test_advance_reveals_one_period_and_progresses(client: TestClient) -> None:
 
     progress = client.get(f"/experiments/{eid}/subjects/s0/progress").json()
     assert progress["next_period"] == 2
+    assert progress["next_available_at"] is None
     assert progress["reveals"] == [
         {
             "period": 1,
             "condition": first_body["condition"],
             "revealed_at": first_body["revealed_at"],
+            "completed_at": None,
         }
     ]
     assert_no_sequence_leak(progress)
@@ -358,6 +408,10 @@ def test_same_request_id_retry_is_idempotent(client: TestClient) -> None:
     progress = client.get(f"/experiments/{eid}/subjects/s1/progress").json()
     assert progress["next_period"] == 2
     assert len(progress["reveals"]) == 1
+
+    # 登记周期 1 完成（washout=0，完成后即可推进）
+    done = complete_period(client, eid, "s1", 1, "c1")
+    assert done.status_code == 200
 
     # 推进到周期 2 后，用旧 request_id 重放仍返回首次（周期 1）结果
     second = client.post(
@@ -510,6 +564,404 @@ def test_invalid_advance_payload_rejected(client: TestClient) -> None:
     assert resp.status_code == 422
 
 
+# ---------- 周期完成与洗脱期门禁 ----------
+
+def test_washout_configured_on_create_and_defaults_zero(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client,
+        conditions=["A", "B"],
+        subject_ids=["s1", "s2"],
+        washout_seconds=900,
+    )
+    assert body["washout_seconds"] == 900
+    listing = client.get("/experiments").json()
+    assert next(
+        e for e in listing if e["experiment_id"] == body["experiment_id"]
+    )["washout_seconds"] == 900
+
+    default_body, _ = create_experiment(
+        client,
+        conditions=["A", "B"],
+        subject_ids=["s3", "s4"],
+        seed=3,
+    )
+    assert default_body["washout_seconds"] == 0
+
+    # 负数洗脱期被拒绝
+    resp = client.post(
+        "/experiments",
+        json={
+            "conditions": ["A", "B"],
+            "subject_ids": ["s5", "s6"],
+            "seed": 1,
+            "washout_seconds": -1,
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_complete_only_allowed_for_revealed_current_period(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=3
+    )
+    eid = body["experiment_id"]
+
+    # 尚未揭盲任何周期
+    early = complete_period(client, eid, "s1", 1, "early")
+    assert early.status_code == 409
+    detail = early.json()["detail"]
+    assert detail["reason"] == "period_out_of_order"
+    assert detail["current_period"] == 0
+
+    first = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+    )
+    assert first.status_code == 200
+
+    # 只能登记当前已揭盲周期，不能提前 / 补登
+    skip = complete_period(client, eid, "s1", 2, "skip")
+    assert skip.status_code == 409
+    assert skip.json()["detail"]["reason"] == "period_out_of_order"
+    assert skip.json()["detail"]["current_period"] == 1
+
+    ok = complete_period(client, eid, "s1", 1, "c1")
+    assert ok.status_code == 200
+    completed_body = ok.json()
+    assert completed_body["period"] == 1
+    assert completed_body["request_id"] == "c1"
+    assert "completed_at" in completed_body
+
+    # 同一周期重复登记（换 request_id）→ 409，completed_at 不被改写
+    again = complete_period(client, eid, "s1", 1, "c1-again")
+    assert again.status_code == 409
+    assert again.json()["detail"]["reason"] == "period_already_completed"
+    assert again.json()["detail"]["current_period"] == 1
+
+
+def test_complete_request_id_is_idempotent_and_replays(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=9
+    )
+    eid = body["experiment_id"]
+    client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+    )
+
+    payload = {"subject_id": "s1", "period": 1, "request_id": "done-1"}
+    first = client.post(f"/experiments/{eid}/complete", json=payload)
+    assert first.status_code == 200
+    for _ in range(3):
+        replay = client.post(f"/experiments/{eid}/complete", json=payload)
+        assert replay.status_code == 200
+        assert replay.json() == first.json()
+
+    # 同一完成幂等键绑定不同周期 / 受试者 → 409
+    other_period = client.post(
+        f"/experiments/{eid}/complete",
+        json={"subject_id": "s1", "period": 2, "request_id": "done-1"},
+    )
+    assert other_period.status_code == 409
+    assert other_period.json()["detail"]["reason"] == "request_id_conflict"
+    other_subject = client.post(
+        f"/experiments/{eid}/complete",
+        json={"subject_id": "s2", "period": 1, "request_id": "done-1"},
+    )
+    assert other_subject.status_code == 409
+
+    # 推进与完成的 request_id 命名空间互不影响
+    second_advance = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 2, "request_id": "a2"},
+    )
+    assert second_advance.status_code == 200
+
+
+def test_advance_blocked_until_prior_period_completed(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=4
+    )
+    eid = body["experiment_id"]
+    client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+    )
+
+    # washout=0 但上一周期尚未完成 → 409，且不泄露下一周期条件
+    blocked = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 2, "request_id": "a2"},
+    )
+    assert blocked.status_code == 409
+    detail = blocked.json()["detail"]
+    assert detail["reason"] == "prior_period_not_completed"
+    assert "condition" not in detail
+    assert "next_period" not in detail
+
+    # 门禁失败不消耗幂等键、不推进：登记完成后原 request_id 首次成功
+    done = complete_period(client, eid, "s1", 1, "c1")
+    assert done.status_code == 200
+    ok = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 2, "request_id": "a2"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["period"] == 2
+
+
+def test_washout_gate_uses_server_time_and_returns_retry_after(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "washout.db"))
+    t0 = datetime(2026, 9, 21, 8, 0, 0, tzinfo=timezone.utc)
+
+    class Clock:
+        def __init__(self) -> None:
+            self.now = t0
+
+        def __call__(self) -> datetime:
+            return self.now
+
+    clock = Clock()
+    monkeypatch.setattr(db, "utc_now", clock)
+
+    with TestClient(app) as local:
+        created = local.post(
+            "/experiments",
+            json={
+                "conditions": ["A", "B"],
+                "subject_ids": ["s1", "s2"],
+                "seed": 1,
+                "washout_seconds": 3600,
+            },
+        ).json()
+        eid = created["experiment_id"]
+
+        first = local.post(
+            f"/experiments/{eid}/advance",
+            json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+        )
+        assert first.status_code == 200
+
+        clock.now += timedelta(seconds=120)
+        done = local.post(
+            f"/experiments/{eid}/complete",
+            json={"subject_id": "s1", "period": 1, "request_id": "c1"},
+        )
+        assert done.status_code == 200
+        completed_at = datetime.fromisoformat(done.json()["completed_at"])
+
+        # 进度只给出下一周期最早可推进时间，不含下一周期条件
+        progress = local.get(f"/experiments/{eid}/subjects/s1/progress").json()
+        assert progress["washout_seconds"] == 3600
+        assert progress["next_period"] == 2
+        assert progress["next_available_at"] == (
+            completed_at + timedelta(seconds=3600)
+        ).isoformat()
+        assert progress["reveals"][0]["completed_at"] == done.json()["completed_at"]
+        assert_no_sequence_leak(progress)
+
+        advance_payload = {
+            "subject_id": "s1",
+            "expected_period": 2,
+            "request_id": "a2",
+        }
+
+        # 刚完成：洗脱期还差 3600 秒
+        blocked = local.post(f"/experiments/{eid}/advance", json=advance_payload)
+        assert blocked.status_code == 409
+        detail = blocked.json()["detail"]
+        assert detail["reason"] == "washout_not_elapsed"
+        assert detail["retry_after_seconds"] == 3600
+        assert "condition" not in detail
+        assert "next_period" not in detail
+
+        # 差 1 秒到期
+        clock.now = completed_at + timedelta(seconds=3599)
+        blocked = local.post(f"/experiments/{eid}/advance", json=advance_payload)
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["retry_after_seconds"] == 1
+
+        # 到期瞬间放行；门禁期间被拒的幂等键仍可首次成功
+        clock.now = completed_at + timedelta(seconds=3600)
+        ok = local.post(f"/experiments/{eid}/advance", json=advance_payload)
+        assert ok.status_code == 200
+        assert ok.json()["period"] == 2
+
+        progress = local.get(f"/experiments/{eid}/subjects/s1/progress").json()
+        assert progress["next_available_at"] is None
+
+
+def test_final_period_can_be_completed(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=8
+    )
+    eid = body["experiment_id"]
+    reveal_sequence(client, eid, "s1", 2)
+
+    final = complete_period(client, eid, "s1", 2, "c2")
+    assert final.status_code == 200
+
+    progress = client.get(f"/experiments/{eid}/subjects/s1/progress").json()
+    assert progress["completed"] is True
+    assert progress["next_period"] == 3
+    assert progress["next_available_at"] is None
+    assert [r["period"] for r in progress["reveals"]] == [1, 2]
+    assert all(r["completed_at"] is not None for r in progress["reveals"])
+
+
+def test_complete_unknown_experiment_or_subject_returns_404(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=6
+    )
+    eid = body["experiment_id"]
+    payload = {"subject_id": "ghost", "period": 1, "request_id": "x"}
+
+    assert client.post(
+        "/experiments/missing/complete", json=payload
+    ).status_code == 404
+    assert client.post(
+        f"/experiments/{eid}/complete", json=payload
+    ).status_code == 404
+
+
+def test_invalid_complete_payload_rejected(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=2
+    )
+    eid = body["experiment_id"]
+
+    resp = client.post(
+        f"/experiments/{eid}/complete",
+        json={"subject_id": "s1", "period": 0, "request_id": "r"},
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        f"/experiments/{eid}/complete",
+        json={"subject_id": "s1", "period": 1, "request_id": ""},
+    )
+    assert resp.status_code == 422
+
+
+def test_concurrent_complete_has_single_winner(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "conc-complete.db"))
+    with TestClient(app) as setup:
+        created = setup.post(
+            "/experiments",
+            json={
+                "conditions": ["A", "B"],
+                "subject_ids": ["s1", "s2"],
+                "seed": 12,
+            },
+        ).json()
+        setup.post(
+            f"/experiments/{created['experiment_id']}/advance",
+            json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+        )
+    eid = created["experiment_id"]
+
+    n_threads = 8
+    barrier = threading.Barrier(n_threads)
+    statuses: list[int] = []
+    statuses_lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        with TestClient(app) as local_client:
+            barrier.wait()
+            resp = local_client.post(
+                f"/experiments/{eid}/complete",
+                json={"subject_id": "s1", "period": 1, "request_id": f"c-{i}"},
+            )
+            with statuses_lock:
+                statuses.append(resp.status_code)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert statuses.count(200) == 1
+    assert statuses.count(409) == n_threads - 1
+
+    with TestClient(app) as verify:
+        progress = verify.get(
+            f"/experiments/{eid}/subjects/s1/progress"
+        ).json()
+    assert progress["next_period"] == 2
+    assert progress["reveals"][0]["completed_at"] is not None
+    # 完成只登记一次：完成后下一周期立刻可推进（washout=0）
+    with TestClient(app) as verify:
+        advanced = verify.post(
+            f"/experiments/{eid}/advance",
+            json={"subject_id": "s1", "expected_period": 2, "request_id": "a2"},
+        )
+    assert advanced.status_code == 200
+
+
+def test_concurrent_advance_after_completion_has_single_winner(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "conc-advance.db"))
+    with TestClient(app) as setup:
+        created = setup.post(
+            "/experiments",
+            json={
+                "conditions": ["A", "B"],
+                "subject_ids": ["s1", "s2"],
+                "seed": 13,
+            },
+        ).json()
+        eid = created["experiment_id"]
+        setup.post(
+            f"/experiments/{eid}/advance",
+            json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+        )
+        setup.post(
+            f"/experiments/{eid}/complete",
+            json={"subject_id": "s1", "period": 1, "request_id": "c1"},
+        )
+
+    n_threads = 8
+    barrier = threading.Barrier(n_threads)
+    statuses: list[int] = []
+    statuses_lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        with TestClient(app) as local_client:
+            barrier.wait()
+            resp = local_client.post(
+                f"/experiments/{eid}/advance",
+                json={
+                    "subject_id": "s1",
+                    "expected_period": 2,
+                    "request_id": f"race2-{i}",
+                },
+            )
+            with statuses_lock:
+                statuses.append(resp.status_code)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert statuses.count(200) == 1
+    assert statuses.count(409) == n_threads - 1
+    with TestClient(app) as verify:
+        progress = verify.get(
+            f"/experiments/{eid}/subjects/s1/progress"
+        ).json()
+    assert progress["next_period"] == 3
+    assert len(progress["reveals"]) == 2
+
+
 # ---------- 旧库启动时自动补齐表结构 ----------
 
 def test_startup_migrates_legacy_database(tmp_path, monkeypatch) -> None:
@@ -554,6 +1006,8 @@ def test_startup_migrates_legacy_database(tmp_path, monkeypatch) -> None:
     with TestClient(app) as migrated:
         detail = migrated.get("/experiments/legacy-1").json()
         assert detail["num_subjects"] == 6
+        # 旧实验缺少 washout_seconds 列：迁移后按 0 秒处理
+        assert detail["washout_seconds"] == 0
         assert_no_sequence_leak(detail)
 
         progress = migrated.get(
@@ -561,6 +1015,8 @@ def test_startup_migrates_legacy_database(tmp_path, monkeypatch) -> None:
         ).json()
         assert progress["next_period"] == 1
         assert progress["num_periods"] == 3
+        assert progress["washout_seconds"] == 0
+        assert progress["next_available_at"] is None
         assert progress["reveals"] == []
 
         resp = migrated.post(
@@ -573,3 +1029,32 @@ def test_startup_migrates_legacy_database(tmp_path, monkeypatch) -> None:
         )
         assert resp.status_code == 200
         assert resp.json()["condition"] == "A"
+
+        # 未完成上一周期不能推进；旧实验 washout=0，完成后立即放行
+        blocked = migrated.post(
+            "/experiments/legacy-1/advance",
+            json={
+                "subject_id": "s0",
+                "expected_period": 2,
+                "request_id": "boot-2",
+            },
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["reason"] == "prior_period_not_completed"
+
+        done = migrated.post(
+            "/experiments/legacy-1/complete",
+            json={"subject_id": "s0", "period": 1, "request_id": "done-1"},
+        )
+        assert done.status_code == 200
+
+        second = migrated.post(
+            "/experiments/legacy-1/advance",
+            json={
+                "subject_id": "s0",
+                "expected_period": 2,
+                "request_id": "boot-2",
+            },
+        )
+        assert second.status_code == 200
+        assert second.json()["condition"] == "C"
